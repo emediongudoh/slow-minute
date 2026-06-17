@@ -1,0 +1,15 @@
+aiohttp
+aiosignal
+async-timeout
+websockets
+rich
+python-dotenv
+web3>=6.0.0
+py-clob-client
+py_clob_client_v2
+requests
+fastapi
+uvicorn[standard]
+jinja2
+setuptools
+wheel
