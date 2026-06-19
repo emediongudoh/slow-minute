@@ -1,8 +1,10 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import re
+import threading
 import requests  # type: ignore
 import websockets  # type: ignore
 import time as t
@@ -214,6 +216,150 @@ MAX_HISTORY_POINTS    = 60_000          # ~1 year at 1 pt per 10 min
 # All assets the bot tracks across every worker.
 _ALL_ASSETS = ["btc", "eth", "sol", "xrp"]
 
+# ── Process-wide worker registry ──────────────────────────────────────────
+# ROOT CAUSE OF CHART SPIKES (see notes above portfolio_history_snapshot):
+# log_pnl() used to push *one asset's* cumulative_pnl into the shared,
+# cross-asset portfolio history key. That single-asset value would land
+# right next to genuinely correct cross-asset totals (written every 60 s by
+# main.py's portfolio_snapshot_loop, and by the startup backfill), producing
+# a sharp up/down spike on every single trade close.
+#
+# Fix: every MarketWorker registers itself here at construction time. Any
+# code that needs "the total portfolio PnL right now" sums cumulative_pnl
+# across every registered worker instead of using one worker's own value.
+_worker_registry: List["MarketWorker"] = []
+_worker_registry_lock = threading.Lock()
+
+
+def _register_worker(worker: "MarketWorker") -> None:
+    with _worker_registry_lock:
+        if worker not in _worker_registry:
+            _worker_registry.append(worker)
+
+
+def _portfolio_total_pnl() -> float:
+    """Sum cumulative_pnl across every live MarketWorker in this process.
+
+    This is the single source of truth for 'total portfolio PnL right now' —
+    every write into emiliano:portfolio:history must go through this (or the
+    equivalent get_global_stats()-based total in main.py) rather than any
+    one worker's own self.cumulative_pnl.
+    """
+    with _worker_registry_lock:
+        workers = list(_worker_registry)
+    total = 0.0
+    for w in workers:
+        try:
+            v = getattr(w, "cumulative_pnl", 0.0)
+            if _is_finite_number(v):
+                total += v
+        except Exception:
+            continue
+    return round(total, 4)
+
+
+# ── Value / timestamp validation ──────────────────────────────────────────
+
+def _is_finite_number(v: Any) -> bool:
+    """True only for real, finite int/float values. Rejects None, NaN, Inf,
+    bool, strings, etc. Used to keep corrupted values out of persisted
+    history and to reject them again at read time as a second line of
+    defense."""
+    if isinstance(v, bool):
+        return False
+    if not isinstance(v, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(v))
+    except Exception:
+        return False
+
+
+def sanitize_portfolio_history(points: List[Dict], *, drop_isolated_spikes: bool = True) -> List[Dict]:
+    """
+    Single source of truth for cleaning a portfolio-history point list before
+    it is either persisted to Redis or served to the chart.
+
+    Guarantees on the returned list:
+      • Every point has a finite numeric 't' (int, unix ms) and 'v' (float).
+      • No two points share the same 't' (last-write-wins on duplicates).
+      • Strictly increasing 't' (i.e. chronological order is enforced, not
+        just sorted — true duplicates are already gone by the time we sort).
+      • Optionally drops "isolated spikes": a single point whose value jumps
+        far away from both neighbors and then jumps right back, which is the
+        exact signature of a one-off corrupted write landing between two
+        otherwise-correct totals.
+
+    This function is intentionally conservative about the spike filter —
+    genuine, large, sustained portfolio swings are never removed, only
+    single-point spike-and-revert artifacts.
+    """
+    cleaned: Dict[int, float] = {}
+    for p in points:
+        if not isinstance(p, dict):
+            continue
+        t_raw = p.get("t")
+        v_raw = p.get("v")
+        if t_raw is None or v_raw is None:
+            continue
+        try:
+            t_ms = int(t_raw)
+        except (TypeError, ValueError):
+            continue
+        if not _is_finite_number(v_raw):
+            continue
+        if t_ms <= 0:
+            continue
+        v = round(float(v_raw), 4)
+        # Last write wins for exact-duplicate timestamps (e.g. a retried
+        # write, or a 60-s loop tick that lands on the same millisecond as a
+        # trade-close write).
+        cleaned[t_ms] = v
+
+    ordered = [{"t": ts, "v": v} for ts, v in sorted(cleaned.items())]
+
+    if drop_isolated_spikes and len(ordered) >= 3:
+        ordered = _drop_isolated_spikes(ordered)
+
+    return ordered
+
+
+def _drop_isolated_spikes(points: List[Dict]) -> List[Dict]:
+    """
+    Remove single-point spikes: a point whose value jumps far from BOTH
+    neighbors, where the neighbors themselves are close to each other (i.e.
+    the series jumps away and immediately jumps back). This is the exact
+    shape produced by a stray bad write landing between two correct points,
+    and it is conservative enough to leave real, sustained PnL moves intact.
+    """
+    if len(points) < 3:
+        return points
+
+    values = [p["v"] for p in points]
+    diffs  = [abs(values[i] - values[i - 1]) for i in range(1, len(values))]
+    diffs_sorted = sorted(diffs)
+    mid = len(diffs_sorted) // 2
+    median_step = diffs_sorted[mid] if diffs_sorted else 0.0
+
+    # Floor so that a perfectly flat or near-flat series doesn't make the
+    # spike threshold collapse to (near) zero.
+    floor = max(5.0, median_step * 4)
+
+    keep = [True] * len(points)
+    for i in range(1, len(points) - 1):
+        prev_v, cur_v, next_v = values[i - 1], values[i], values[i + 1]
+        jump_in  = abs(cur_v - prev_v)
+        jump_out = abs(next_v - cur_v)
+        settle   = abs(next_v - prev_v)
+        if jump_in < floor or jump_out < floor:
+            continue
+        # Both surrounding jumps are large, but the series basically returns
+        # to where it started → this point is an isolated spike.
+        if settle <= max(jump_in, jump_out) * 0.35:
+            keep[i] = False
+
+    return [p for p, k in zip(points, keep) if k]
+
 # Timestamp format written by log_pnl() via datetime.now().strftime(...)
 _TS_PRIMARY = "%Y-%m-%d %H:%M:%S"
 
@@ -288,7 +434,7 @@ def _build_equity_curve(all_trades_by_asset: Dict[str, List[Dict]]) -> List[Dict
     for asset, trades in all_trades_by_asset.items():
         for trade in trades:
             cum = trade.get("cumulative_pnl")
-            if cum is None:
+            if cum is None or not _is_finite_number(cum):
                 continue
             ts_ms = _parse_ts(trade.get("timestamp", ""))
             if ts_ms is None:
@@ -309,6 +455,7 @@ def _build_equity_curve(all_trades_by_asset: Dict[str, List[Dict]]) -> List[Dict
         seen_ts[ts_ms] = total          # last-write-wins for duplicate timestamps
 
     curve = [{"t": ts, "v": v} for ts, v in sorted(seen_ts.items())]
+    curve = sanitize_portfolio_history(curve, drop_isolated_spikes=False)
     return curve
 
 
@@ -367,9 +514,10 @@ def portfolio_history_backfill() -> int:
         print("⚠️  [backfill] Could not build equity curve (no parseable timestamps).")
         return 0
 
-    # Step 4: merge with existing history
+    # Step 4: merge with existing (already-sanitized) history
     # Existing points that post-date the last backfill point (live snapshots
     # recorded since previous deploy) are preserved; backfill replaces older pts.
+    existing_history = sanitize_portfolio_history(existing_history, drop_isolated_spikes=False)
     last_backfill_t = backfill_curve[-1]["t"] if backfill_curve else 0
     live_tail = [p for p in existing_history if p["t"] > last_backfill_t]
 
@@ -379,13 +527,20 @@ def portfolio_history_backfill() -> int:
     for p in live_tail:
         merged[p["t"]] = p["v"]    # live points win on any overlap
 
-    final_curve = [{"t": ts, "v": v} for ts, v in sorted(merged.items())]
+    final_curve = sanitize_portfolio_history(
+        [{"t": ts, "v": v} for ts, v in sorted(merged.items())],
+        drop_isolated_spikes=False,
+    )
 
     # Cap to max points
     if len(final_curve) > MAX_HISTORY_POINTS:
         final_curve = final_curve[-MAX_HISTORY_POINTS:]
 
-    # Step 5: write back
+    # Step 5: write back (best-effort backup of the pre-backfill state so a
+    # bad rebuild can always be rolled back manually)
+    if existing_history:
+        redis_set_json(f"{PORTFOLIO_HISTORY_KEY}:backup:pre_backfill", existing_history)
+
     ok = redis_set_json(PORTFOLIO_HISTORY_KEY, final_curve)
     if ok:
         print(f"✅ [backfill] Wrote {len(final_curve)} portfolio history points to Redis "
@@ -397,7 +552,47 @@ def portfolio_history_backfill() -> int:
     return len(backfill_curve)
 
 
-def portfolio_history_snapshot(total_pnl: float) -> bool:
+# Serializes all read-modify-write cycles against PORTFOLIO_HISTORY_KEY within
+# this process. log_pnl() (per-trade writes) and portfolio_snapshot_loop in
+# main.py (60-s heartbeat writes) both call portfolio_history_snapshot(), and
+# without this lock two near-simultaneous calls could each read the same
+# "existing" list, then write back, with one call's point silently lost
+# (a classic lost-update race). A threading.Lock (not asyncio.Lock) is used
+# deliberately: log_pnl is a plain synchronous function and may be called
+# from sync contexts (e.g. the cleanup/migration script) as well as from
+# inside async methods, so the lock must work in both.
+#
+# Note on scope: this protects against races *within a single process*. If
+# this dashboard is ever scaled to more than one Render instance writing the
+# same Redis key, a true cross-process lock (Redis MULTI/Lua, or a proper
+# distributed mutex) would be required — the lightweight Upstash REST client
+# used here only exposes plain GET/SET, not atomic compare-and-swap.
+_history_write_lock = threading.Lock()
+
+# Tracks the most recent round-key written per (asset, slug) so a duplicate
+# log_pnl() call for the same market round (e.g. a retried exit handler)
+# cannot double-write a snapshot for that round.
+_recent_round_writes: Dict[str, float] = {}
+_ROUND_DEDUP_TTL_SEC = 600  # 10 minutes — far longer than one 5-min round
+
+
+def _round_already_written(round_key: Optional[str]) -> bool:
+    if not round_key:
+        return False
+    now = t.time()
+    # Opportunistically prune old entries so this dict never grows unbounded.
+    expired = [k for k, ts in _recent_round_writes.items() if now - ts > _ROUND_DEDUP_TTL_SEC]
+    for k in expired:
+        _recent_round_writes.pop(k, None)
+    return round_key in _recent_round_writes
+
+
+def _mark_round_written(round_key: Optional[str]) -> None:
+    if round_key:
+        _recent_round_writes[round_key] = t.time()
+
+
+def portfolio_history_snapshot(total_pnl: float, round_key: Optional[str] = None) -> bool:
     """
     Append one live {t, v} snapshot to Redis immediately.
 
@@ -407,38 +602,76 @@ def portfolio_history_snapshot(total_pnl: float) -> bool:
     Also called by main.py's portfolio_snapshot_loop every 60 s during normal
     operation so the curve stays continuous even in idle periods with no trades.
 
-    Returns True on success.
+    Parameters
+    ──────────
+    total_pnl : the TOTAL portfolio PnL across every asset right now — never
+                a single asset's own cumulative_pnl. Callers must use
+                _portfolio_total_pnl() (or main.py's get_global_stats()
+                total) to compute this.
+    round_key : optional unique key (e.g. "{asset}:{slug}") identifying the
+                market round this write corresponds to. When provided, a
+                second call with the same round_key within
+                _ROUND_DEDUP_TTL_SEC is ignored — this is the "only one valid
+                snapshot per market round" safeguard.
+
+    Returns True on success (including a successful no-op skip for a
+    duplicate round_key — there is nothing left to do, which counts as
+    success), False on a real failure.
     """
+    if not _is_finite_number(total_pnl):
+        print(f"⚠️ portfolio_history_snapshot rejected non-finite value: {total_pnl!r}")
+        return False
+
+    if _round_already_written(round_key):
+        print(f"ℹ️ portfolio_history_snapshot skipped duplicate round write for {round_key!r}")
+        return True
+
     if not _redis_available:
+        _mark_round_written(round_key)
         return False
-    try:
-        existing: List[Dict] = redis_get_json(PORTFOLIO_HISTORY_KEY) or []
-        now_ms = int(t.time() * 1000)
 
-        # Avoid duplicate timestamps: if the last point is within 2 s just update it
-        if existing and (now_ms - existing[-1]["t"]) < 2000:
-            existing[-1]["v"] = round(total_pnl, 4)
-        else:
-            existing.append({"t": now_ms, "v": round(total_pnl, 4)})
+    with _history_write_lock:
+        try:
+            existing: List[Dict] = redis_get_json(PORTFOLIO_HISTORY_KEY) or []
+            existing = sanitize_portfolio_history(existing, drop_isolated_spikes=False)
+            now_ms = int(t.time() * 1000)
+            new_v  = round(float(total_pnl), 4)
 
-        if len(existing) > MAX_HISTORY_POINTS:
-            existing = existing[-MAX_HISTORY_POINTS:]
+            # Avoid near-duplicate timestamps: if the last point is within
+            # 2 s just update it in place rather than adding a near-zero-
+            # width vertical segment.
+            if existing and (now_ms - existing[-1]["t"]) < 2000:
+                existing[-1]["v"] = new_v
+            else:
+                existing.append({"t": now_ms, "v": new_v})
 
-        return redis_set_json(PORTFOLIO_HISTORY_KEY, existing)
-    except Exception as e:
-        print(f"⚠️ portfolio_history_snapshot error: {e}")
-        return False
+            existing = sanitize_portfolio_history(existing, drop_isolated_spikes=False)
+
+            if len(existing) > MAX_HISTORY_POINTS:
+                existing = existing[-MAX_HISTORY_POINTS:]
+
+            ok = redis_set_json(PORTFOLIO_HISTORY_KEY, existing)
+            if ok:
+                _mark_round_written(round_key)
+            return ok
+        except Exception as e:
+            print(f"⚠️ portfolio_history_snapshot error: {e}")
+            return False
 
 
 def portfolio_history_get(period: str = "ALL") -> List[Dict]:
     """
     Fetch portfolio history filtered to the requested period.
     period: '1D' | '1W' | '1M' | '1Y' | 'ALL'
-    Returns list of {t: unix_ms, v: pnl} dicts, oldest-first.
+    Returns list of {t: unix_ms, v: pnl} dicts, oldest-first, fully
+    sanitized (validated, de-duplicated, strictly chronological, with
+    isolated single-point spikes removed).
     Always returns at least the most recent point as a baseline.
     """
-    all_pts: List[Dict] = redis_get_json(PORTFOLIO_HISTORY_KEY) or []
-    if not all_pts or period == "ALL":
+    raw_pts: List[Dict] = redis_get_json(PORTFOLIO_HISTORY_KEY) or []
+    all_pts = sanitize_portfolio_history(raw_pts, drop_isolated_spikes=True)
+
+    if not all_pts or period.upper() == "ALL":
         return all_pts
 
     period_ms: Optional[int] = {
@@ -987,6 +1220,16 @@ class MarketWorker:
             "imbalance_momentum": 0.0,
         }
         self.recent_logs: Deque[str] = deque(maxlen=4)
+
+        # Last market slug for which a trade has been logged. Used by
+        # log_pnl() as a per-round dedup guard so a retried exit handler
+        # cannot double-log (and double-snapshot) the same market round.
+        self._last_logged_slug: Optional[str] = None
+
+        # Register with the process-wide worker registry so
+        # _portfolio_total_pnl() can sum every asset's PnL when computing
+        # the cross-asset portfolio total for the equity chart.
+        _register_worker(self)
 
     # ═════════════════════════════════════════════════════════════════════
     # REDIS-BACKED PnL PERSISTENCE  (per-asset — each market keeps its own
@@ -1792,6 +2035,26 @@ class MarketWorker:
         market_question = ((self.active_market.get("question", "Unknown")
                             if self.active_market else "Unknown Market"))
 
+        # ── Validation: reject corrupted PnL values outright ─────────────
+        # A NaN/Inf/None pnl_amount (e.g. from a divide-by-zero upstream, or
+        # a malformed fill response) must never be allowed to corrupt
+        # cumulative_pnl or the persisted history — once a bad value is
+        # added in, every later point is wrong forever.
+        if not _is_finite_number(pnl_amount):
+            print(f"❌ [{self.asset_type.upper()}] log_pnl rejected non-finite pnl_amount "
+                  f"({pnl_amount!r}) for market {slug} — trade NOT recorded.")
+            return
+
+        # ── Per-round dedup guard ──────────────────────────────────────────
+        # "Only one valid snapshot per market round": if this exact slug was
+        # already logged (e.g. a retried exit path firing twice), skip the
+        # second call entirely rather than double-counting the trade.
+        round_key = f"{self.asset_type}:{slug}"
+        if slug != "unknown" and slug == self._last_logged_slug:
+            print(f"ℹ️ [{self.asset_type.upper()}] log_pnl skipped duplicate call for "
+                  f"already-logged market {slug}.")
+            return
+
         self.cumulative_pnl = round(self.cumulative_pnl + pnl_amount, 4)
         if pnl_amount > 0:
             self.wins   += 1
@@ -1815,17 +2078,20 @@ class MarketWorker:
 
         self._save_stats_to_redis()
         self._append_trade_to_redis(entry)
+        self._last_logged_slug = slug
 
         # ── Live portfolio history snapshot ──────────────────────────────
         # Push a portfolio-total point to emiliano:portfolio:history right
         # now so the chart updates the moment this trade closes, without
         # waiting for any background flush interval.
-        # We need the sum across all assets; the best approximation available
-        # here (without a cross-worker reference) is self.cumulative_pnl for
-        # this asset alone.  The full cross-asset total is written by the
-        # portfolio_snapshot_loop in main.py every 60 s; this immediate write
-        # ensures the curve reacts to each trade result instantly.
-        portfolio_history_snapshot(self.cumulative_pnl)
+        #
+        # IMPORTANT (this was the root cause of the chart spikes): this MUST
+        # be the TOTAL PnL across every asset, never self.cumulative_pnl for
+        # this asset alone. Using a single asset's own PnL here produced a
+        # sharp spike/drop on every trade close, because that value would be
+        # written right next to genuinely correct cross-asset totals from
+        # the 60-s background loop and the startup backfill.
+        portfolio_history_snapshot(_portfolio_total_pnl(), round_key=round_key)
 
         default_data = {"total_pnl": 0.0, "wins": 0, "losses": 0,
                         "win_rate": "0%", "trades": []}

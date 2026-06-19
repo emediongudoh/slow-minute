@@ -30,15 +30,41 @@ try:
         portfolio_history_backfill,
         portfolio_history_snapshot,
         portfolio_history_get,
+        sanitize_portfolio_history,
     )
     _portfolio_available = True
 except ImportError:
     print("⚠️  Portfolio history functions not found in bot.py — "
           "persistent history disabled. Deploy the updated bot.py to enable it.")
-    portfolio_history_backfill = None   # type: ignore
-    portfolio_history_snapshot = None   # type: ignore
-    portfolio_history_get      = None   # type: ignore
-    _portfolio_available       = False
+    portfolio_history_backfill   = None   # type: ignore
+    portfolio_history_snapshot   = None   # type: ignore
+    portfolio_history_get        = None   # type: ignore
+    sanitize_portfolio_history   = None   # type: ignore
+    _portfolio_available         = False
+
+    def _fallback_sanitize_portfolio_history(points, drop_isolated_spikes: bool = True):
+        """Minimal stand-in used only if an older bot.py lacks the real
+        sanitize_portfolio_history(). Validates, de-duplicates by timestamp
+        (last write wins), and sorts chronologically. Does not include the
+        isolated-spike filter — upgrade bot.py to get that."""
+        cleaned = {}
+        for p in points or []:
+            if not isinstance(p, dict):
+                continue
+            t_raw, v_raw = p.get("t"), p.get("v")
+            if t_raw is None or v_raw is None:
+                continue
+            try:
+                t_ms = int(t_raw)
+                v    = float(v_raw)
+            except (TypeError, ValueError):
+                continue
+            if t_ms <= 0 or v != v or v in (float("inf"), float("-inf")):
+                continue
+            cleaned[t_ms] = round(v, 4)
+        return [{"t": ts, "v": v} for ts, v in sorted(cleaned.items())]
+
+    sanitize_portfolio_history = _fallback_sanitize_portfolio_history
 
 load_dotenv()
 
@@ -205,8 +231,21 @@ async def portfolio_snapshot_loop():
         await asyncio.sleep(_SNAPSHOT_EVERY_SEC)
         try:
             stats     = get_global_stats()
-            total_pnl = round(stats.get("total_pnl", 0.0), 4)
-            now_ms    = int(_time.time() * 1000)
+            total_pnl = stats.get("total_pnl", 0.0)
+
+            # Defensive validation: never let a NaN/Inf/None total_pnl (e.g.
+            # from a transient division error inside get_global_stats) reach
+            # the buffer or Redis. One bad value here would otherwise become
+            # a permanent corrupted point in the chart.
+            try:
+                total_pnl = round(float(total_pnl), 4)
+                if total_pnl != total_pnl or total_pnl in (float("inf"), float("-inf")):
+                    raise ValueError("non-finite total_pnl")
+            except (TypeError, ValueError):
+                print(f"⚠️ portfolio_snapshot_loop: rejected non-finite total_pnl={total_pnl!r}")
+                continue
+
+            now_ms = int(_time.time() * 1000)
             _snapshot_buffer.append({"t": now_ms, "v": total_pnl})
 
             # Safety cap: never let the buffer grow beyond 10 000 points
@@ -218,7 +257,10 @@ async def portfolio_snapshot_loop():
             if _portfolio_available and portfolio_history_snapshot and (
                     now - _last_redis_flush >= _FLUSH_EVERY_SEC):
                 _last_redis_flush = now
-                # Write each buffered point in order
+                # Write each buffered point in order. portfolio_history_snapshot()
+                # itself validates, locks, and de-duplicates — this loop never
+                # needs a round_key since these are heartbeat points, not
+                # per-trade/per-round points.
                 for pt in _snapshot_buffer:
                     portfolio_history_snapshot(pt["v"])
                 _snapshot_buffer.clear()
@@ -336,7 +378,11 @@ async def api_history(period: str = "1D"):
       2. _snapshot_buffer (in-memory points not yet flushed to Redis)
          - ensures the chart reflects the last 60 s even between Redis flushes
     """
-    # Layer 1: Redis (includes backfilled historical trade data)
+    # Layer 1: Redis (includes backfilled historical trade data).
+    # portfolio_history_get() already returns a fully sanitized list
+    # (validated, de-duplicated, chronological, isolated spikes removed),
+    # but we re-sanitize the merged result below anyway since merging in the
+    # in-memory buffer can reintroduce duplicate timestamps.
     persisted: list = []
     if _portfolio_available and portfolio_history_get:
         try:
@@ -345,15 +391,12 @@ async def api_history(period: str = "1D"):
             print(f"⚠️ /api/history Redis read error: {e}")
 
     # Layer 2: in-memory buffer (live points not yet persisted)
-    existing_ts = {p["t"] for p in persisted}
-    merged      = list(persisted)
-    for pt in _snapshot_buffer:
-        if pt["t"] not in existing_ts:
-            merged.append(pt)
-            existing_ts.add(pt["t"])
+    merged = list(persisted) + list(_snapshot_buffer)
 
-    # Sort and deduplicate
-    merged.sort(key=lambda p: p["t"])
+    # Single source of truth for validation/dedup/chronology. This is the
+    # same function used before every Redis write, so the data shown on the
+    # chart is held to the same standard as the data actually persisted.
+    merged = sanitize_portfolio_history(merged, drop_isolated_spikes=True)
 
     # Forward-fill gaps > 5 min to keep the equity curve continuous
     # even during idle periods between trades.
@@ -584,18 +627,32 @@ function _periodLabel(p) {
 }
 
 // Merge history + live, forward-fill gaps > 5 min, sort oldest-first.
+// Defensive client-side validation mirrors the backend's
+// sanitize_portfolio_history(): reject any point with a non-finite value or
+// missing timestamp before it ever reaches the chart renderer.
+function _isFiniteNum(v) {
+  return typeof v === 'number' && isFinite(v);
+}
 function _mergedPts() {
   const seenT = new Set(_historyPts.map(p => p.t));
   const extra = _livePts.filter(p => !seenT.has(p.t));
-  const raw   = [..._historyPts, ...extra].sort((a, b) => a.t - b.t);
+  const raw   = [..._historyPts, ...extra]
+    .filter(p => p && Number.isFinite(p.t) && _isFiniteNum(p.v))
+    .sort((a, b) => a.t - b.t);
 
-  // Forward-fill: insert synthetic carry-forward points across any gap > 5 min
+  // De-duplicate any exact-timestamp collisions left after merge (last
+  // write wins), then forward-fill gaps > 5 min so idle periods don't
+  // collapse the line into a single segment.
+  const byT = new Map();
+  for (const p of raw) byT.set(p.t, p);
+  const dedup = Array.from(byT.values()).sort((a, b) => a.t - b.t);
+
   const GAP = 5 * 60 * 1000;
   const out  = [];
-  for (let i = 0; i < raw.length; i++) {
-    out.push(raw[i]);
-    if (i < raw.length - 1 && (raw[i+1].t - raw[i].t) > GAP) {
-      out.push({ t: raw[i+1].t - 1, v: raw[i].v, synthetic: true });
+  for (let i = 0; i < dedup.length; i++) {
+    out.push(dedup[i]);
+    if (i < dedup.length - 1 && (dedup[i+1].t - dedup[i].t) > GAP) {
+      out.push({ t: dedup[i+1].t - 1, v: dedup[i].v, synthetic: true });
     }
   }
   return out;
@@ -629,6 +686,7 @@ function setPeriod(p) {
 
 // Called every second from the WebSocket handler with the current total PnL.
 function pushLivePnlPoint(totalPnl) {
+  if (!_isFiniteNum(totalPnl)) return;   // defensive: never chart a NaN/Inf tick
   const now = Date.now();
   if (now - _lastLivePush < 800 && _livePts.length > 0) {
     _livePts[_livePts.length - 1].v = totalPnl;   // debounce: update in place
