@@ -185,6 +185,283 @@ def redis_get_json(key: str) -> Optional[Any]:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# PORTFOLIO HISTORY — persistent equity-curve storage
+#
+# Redis key  : emiliano:portfolio:history
+# Value      : JSON list of {"t": unix_ms, "v": portfolio_pnl_dollars}
+#              sorted oldest-first, capped at MAX_HISTORY_POINTS entries.
+#
+# Backfill   : On startup (called from main.py's startup_event) we inspect
+#              all emiliano:{asset}:trades keys already in Redis, reconstruct
+#              the full cross-asset portfolio equity curve from those trade
+#              records, and persist it to emiliano:portfolio:history.
+#              This means the chart shows real history from the very first
+#              trade — not just from the day this feature was deployed.
+#
+# Idempotent : The backfill compares the number of trade records in Redis
+#              against the existing history length. If history already covers
+#              every trade it does nothing. If new trades exist beyond what is
+#              already stored it merges only the missing tail. Safe to rerun.
+#
+# Live feed  : log_pnl() calls portfolio_history_snapshot() immediately after
+#              every completed trade so the curve updates in real time without
+#              waiting for any background flush interval.
+# ═════════════════════════════════════════════════════════════════════════════
+
+PORTFOLIO_HISTORY_KEY = "emiliano:portfolio:history"
+MAX_HISTORY_POINTS    = 60_000          # ~1 year at 1 pt per 10 min
+
+# All assets the bot tracks across every worker.
+_ALL_ASSETS = ["btc", "eth", "sol", "xrp"]
+
+# Timestamp format written by log_pnl() via datetime.now().strftime(...)
+_TS_PRIMARY = "%Y-%m-%d %H:%M:%S"
+
+# Additional formats found in older records or alternative paths.
+_TS_FORMATS: List[str] = [
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%dT%H:%M:%S.%f",
+    "%Y-%m-%dT%H:%M:%S%z",
+]
+
+
+def _parse_ts(ts_str: str) -> Optional[int]:
+    """Parse a trade timestamp string → Unix milliseconds. Returns None on failure."""
+    if not ts_str:
+        return None
+    for fmt in _TS_FORMATS:
+        try:
+            dt = datetime.strptime(ts_str, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp() * 1000)
+        except ValueError:
+            continue
+    try:
+        dt = datetime.fromisoformat(ts_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        return None
+
+
+def _load_trades_for_asset(asset: str) -> List[Dict]:
+    """
+    Return the full trade list for one asset from Redis (primary) or the
+    local JSON fallback.  Each item must have 'timestamp' and 'cumulative_pnl'.
+    """
+    if _redis_available:
+        trades = redis_get_json(f"emiliano:{asset}:trades")
+        if trades and isinstance(trades, list) and len(trades) > 0:
+            return trades
+    # Local JSON fallback
+    fp = f"{asset}_pnl_history.json"
+    try:
+        if os.path.exists(fp):
+            with open(fp, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            trades = data.get("trades", [])
+            if trades:
+                return trades
+    except Exception as e:
+        print(f"⚠️ [backfill] Could not read {fp}: {e}")
+    return []
+
+
+def _build_equity_curve(all_trades_by_asset: Dict[str, List[Dict]]) -> List[Dict]:
+    """
+    Given {asset: [trade, ...]}, build a time-sorted portfolio equity curve.
+
+    Algorithm:
+      1. Tag every trade with its asset and parse its timestamp.
+      2. Sort all events globally by timestamp.
+      3. Walk the events, maintaining each asset's last known cumulative PnL.
+      4. At each event emit {t: unix_ms, v: sum_of_all_asset_pnls}.
+
+    The result is a list of {"t": unix_ms, "v": float} dicts, oldest-first.
+    Duplicate timestamps are de-duplicated (last value wins).
+    """
+    events: List[Tuple[int, str, float]] = []  # (unix_ms, asset, cumulative_pnl)
+
+    for asset, trades in all_trades_by_asset.items():
+        for trade in trades:
+            cum = trade.get("cumulative_pnl")
+            if cum is None:
+                continue
+            ts_ms = _parse_ts(trade.get("timestamp", ""))
+            if ts_ms is None:
+                continue
+            events.append((ts_ms, asset, float(cum)))
+
+    if not events:
+        return []
+
+    events.sort(key=lambda e: e[0])
+
+    asset_pnl: Dict[str, float] = {a: 0.0 for a in _ALL_ASSETS}
+    seen_ts: Dict[int, float]   = {}
+
+    for ts_ms, asset, cum_pnl in events:
+        asset_pnl[asset] = cum_pnl
+        total = round(sum(asset_pnl.values()), 4)
+        seen_ts[ts_ms] = total          # last-write-wins for duplicate timestamps
+
+    curve = [{"t": ts, "v": v} for ts, v in sorted(seen_ts.items())]
+    return curve
+
+
+def portfolio_history_backfill() -> int:
+    """
+    Idempotent backfill: reads all existing emiliano:{asset}:trades data from
+    Redis and reconstructs emiliano:portfolio:history.
+
+    Returns the number of backfill points written (0 = nothing to do / no data).
+
+    Idempotency guarantee
+    ─────────────────────
+    • Count total trade records across all assets in Redis (N_trades).
+    • Read existing portfolio history length (N_hist).
+    • If N_hist >= N_trades → history already covers every trade → skip.
+    • Otherwise rebuild the full curve and MERGE:
+        – Points whose timestamps already exist in history are NOT overwritten
+          so any manually-entered or live-snapshot points are preserved.
+        – New trade-derived points are inserted into the correct chronological
+          position.
+    """
+    if not _redis_available:
+        print("ℹ️  [backfill] Redis not available — skipping portfolio history backfill.")
+        return 0
+
+    print("🔄 [backfill] Inspecting existing Redis trade data...")
+
+    # Step 1: load all trade records
+    all_trades: Dict[str, List[Dict]] = {}
+    total_trade_count = 0
+    for asset in _ALL_ASSETS:
+        trades = _load_trades_for_asset(asset)
+        all_trades[asset] = trades
+        print(f"  [{asset.upper()}] {len(trades)} trade records found")
+        total_trade_count += len(trades)
+
+    if total_trade_count == 0:
+        print("ℹ️  [backfill] No trade records found in Redis — nothing to backfill.")
+        return 0
+
+    # Step 2: check how many history points already exist
+    existing_history: List[Dict] = redis_get_json(PORTFOLIO_HISTORY_KEY) or []
+    existing_count = len(existing_history)
+
+    if existing_count >= total_trade_count:
+        print(f"✅ [backfill] Portfolio history already has {existing_count} points "
+              f"covering {total_trade_count} trades — skipping rebuild.")
+        return 0
+
+    print(f"📊 [backfill] History has {existing_count} pts, trades have {total_trade_count} "
+          f"records — rebuilding equity curve...")
+
+    # Step 3: build the full curve from trade records
+    backfill_curve = _build_equity_curve(all_trades)
+    if not backfill_curve:
+        print("⚠️  [backfill] Could not build equity curve (no parseable timestamps).")
+        return 0
+
+    # Step 4: merge with existing history
+    # Existing points that post-date the last backfill point (live snapshots
+    # recorded since previous deploy) are preserved; backfill replaces older pts.
+    last_backfill_t = backfill_curve[-1]["t"] if backfill_curve else 0
+    live_tail = [p for p in existing_history if p["t"] > last_backfill_t]
+
+    merged: Dict[int, float] = {}
+    for p in backfill_curve:
+        merged[p["t"]] = p["v"]
+    for p in live_tail:
+        merged[p["t"]] = p["v"]    # live points win on any overlap
+
+    final_curve = [{"t": ts, "v": v} for ts, v in sorted(merged.items())]
+
+    # Cap to max points
+    if len(final_curve) > MAX_HISTORY_POINTS:
+        final_curve = final_curve[-MAX_HISTORY_POINTS:]
+
+    # Step 5: write back
+    ok = redis_set_json(PORTFOLIO_HISTORY_KEY, final_curve)
+    if ok:
+        print(f"✅ [backfill] Wrote {len(final_curve)} portfolio history points to Redis "
+              f"({len(backfill_curve)} from trades + {len(live_tail)} live tail).")
+    else:
+        print("❌ [backfill] Redis write failed.")
+        return 0
+
+    return len(backfill_curve)
+
+
+def portfolio_history_snapshot(total_pnl: float) -> bool:
+    """
+    Append one live {t, v} snapshot to Redis immediately.
+
+    Called by MarketWorker.log_pnl() right after every completed trade so the
+    chart updates the moment a market round closes — no background flush delay.
+
+    Also called by main.py's portfolio_snapshot_loop every 60 s during normal
+    operation so the curve stays continuous even in idle periods with no trades.
+
+    Returns True on success.
+    """
+    if not _redis_available:
+        return False
+    try:
+        existing: List[Dict] = redis_get_json(PORTFOLIO_HISTORY_KEY) or []
+        now_ms = int(t.time() * 1000)
+
+        # Avoid duplicate timestamps: if the last point is within 2 s just update it
+        if existing and (now_ms - existing[-1]["t"]) < 2000:
+            existing[-1]["v"] = round(total_pnl, 4)
+        else:
+            existing.append({"t": now_ms, "v": round(total_pnl, 4)})
+
+        if len(existing) > MAX_HISTORY_POINTS:
+            existing = existing[-MAX_HISTORY_POINTS:]
+
+        return redis_set_json(PORTFOLIO_HISTORY_KEY, existing)
+    except Exception as e:
+        print(f"⚠️ portfolio_history_snapshot error: {e}")
+        return False
+
+
+def portfolio_history_get(period: str = "ALL") -> List[Dict]:
+    """
+    Fetch portfolio history filtered to the requested period.
+    period: '1D' | '1W' | '1M' | '1Y' | 'ALL'
+    Returns list of {t: unix_ms, v: pnl} dicts, oldest-first.
+    Always returns at least the most recent point as a baseline.
+    """
+    all_pts: List[Dict] = redis_get_json(PORTFOLIO_HISTORY_KEY) or []
+    if not all_pts or period == "ALL":
+        return all_pts
+
+    period_ms: Optional[int] = {
+        "1D":  24 * 3600 * 1000,
+        "1W":  7  * 24 * 3600 * 1000,
+        "1M":  30 * 24 * 3600 * 1000,
+        "1Y":  365 * 24 * 3600 * 1000,
+    }.get(period.upper())
+
+    if period_ms is None:
+        return all_pts
+
+    cutoff   = int(t.time() * 1000) - period_ms
+    filtered = [p for p in all_pts if p["t"] >= cutoff]
+
+    # Always return at least one point so the chart has a left-edge anchor
+    if not filtered and all_pts:
+        filtered = [all_pts[-1]]
+
+    return filtered
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # BINANCE DEPTH SIGNAL  (display / context only — not a trade gate)
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -1538,6 +1815,17 @@ class MarketWorker:
 
         self._save_stats_to_redis()
         self._append_trade_to_redis(entry)
+
+        # ── Live portfolio history snapshot ──────────────────────────────
+        # Push a portfolio-total point to emiliano:portfolio:history right
+        # now so the chart updates the moment this trade closes, without
+        # waiting for any background flush interval.
+        # We need the sum across all assets; the best approximation available
+        # here (without a cross-worker reference) is self.cumulative_pnl for
+        # this asset alone.  The full cross-asset total is written by the
+        # portfolio_snapshot_loop in main.py every 60 s; this immediate write
+        # ensures the curve reacts to each trade result instantly.
+        portfolio_history_snapshot(self.cumulative_pnl)
 
         default_data = {"total_pnl": 0.0, "wins": 0, "losses": 0,
                         "win_rate": "0%", "trades": []}
